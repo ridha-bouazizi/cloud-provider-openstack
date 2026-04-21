@@ -2,6 +2,18 @@
 
 Thank you for visiting the `Cloud Provider OpenStack` repository!
 
+## Fork Notice
+
+This repository is a fork of the upstream Kubernetes project:
+
+* https://github.com/kubernetes/cloud-provider-openstack
+
+This fork currently carries local changes for a multi-region OpenStack deployment, focused on the OpenStack Cloud Controller Manager:
+
+* cross-region node lookup during node initialization when `spec.providerID` is not yet set
+* region-aware `ProviderID` generation via `OS_CCM_REGIONAL=true`, producing values such as `openstack://GRA11/<instance-id>`
+* deployment usage with a custom controller image published from this fork for private registry distribution
+
 This Repository hosts various plugins relevant to OpenStack and Kubernetes Integration
 
 * [OpenStack Cloud Controller Manager](/docs/openstack-cloud-controller-manager/using-openstack-cloud-controller-manager.md/)
