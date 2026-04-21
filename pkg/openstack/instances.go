@@ -42,10 +42,14 @@ import (
 const (
 	RegionalProviderIDEnv = "OS_CCM_REGIONAL"
 	instanceShutoff       = "SHUTOFF"
+	nodeRegionLabel       = "topology.kubernetes.io/region"
+	legacyNodeRegionLabel = "failure-domain.beta.kubernetes.io/region"
 )
 
 // InstancesV2 encapsulates an implementation of InstancesV2 for OpenStack.
 type InstancesV2 struct {
+	provider         *gophercloud.ProviderClient
+	availability     gophercloud.Availability
 	compute          *gophercloud.ServiceClient
 	network          *gophercloud.ServiceClient
 	region           string
@@ -75,6 +79,8 @@ func (os *OpenStack) InstancesV2() (cloudprovider.InstancesV2, bool) {
 	}
 
 	return &InstancesV2{
+		provider:         os.provider,
+		availability:     os.epOpts.Availability,
 		compute:          compute,
 		network:          network,
 		region:           os.epOpts.Region,
@@ -100,7 +106,7 @@ func (i *InstancesV2) InstanceExists(ctx context.Context, node *v1.Node) (bool, 
 
 // InstanceShutdown returns true if the instance is shutdown according to the cloud provider.
 func (i *InstancesV2) InstanceShutdown(ctx context.Context, node *v1.Node) (bool, error) {
-	server, err := i.getInstance(ctx, node)
+	server, _, _, _, err := i.getInstanceContext(ctx, node)
 	if err != nil {
 		return false, err
 	}
@@ -115,7 +121,7 @@ func (i *InstancesV2) InstanceShutdown(ctx context.Context, node *v1.Node) (bool
 
 // InstanceMetadata returns the instance's metadata.
 func (i *InstancesV2) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprovider.InstanceMetadata, error) {
-	srv, err := i.getInstance(ctx, node)
+	srv, compute, network, region, err := i.getInstanceContext(ctx, node)
 	if err != nil {
 		return nil, err
 	}
@@ -124,17 +130,17 @@ func (i *InstancesV2) InstanceMetadata(ctx context.Context, node *v1.Node) (*clo
 		server = *srv
 	}
 
-	instanceType, err := srvInstanceType(ctx, i.compute, &server)
+	instanceType, err := srvInstanceType(ctx, compute, &server)
 	if err != nil {
 		return nil, err
 	}
 
-	ports, err := getAttachedPorts(ctx, i.network, server.ID)
+	ports, err := getAttachedPorts(ctx, network, server.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	addresses, err := nodeAddresses(ctx, &server, ports, i.network, i.networkingOpts)
+	addresses, err := nodeAddresses(ctx, &server, ports, network, i.networkingOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -142,44 +148,111 @@ func (i *InstancesV2) InstanceMetadata(ctx context.Context, node *v1.Node) (*clo
 	availabilityZone := util.SanitizeLabel(server.AvailabilityZone)
 
 	return &cloudprovider.InstanceMetadata{
-		ProviderID:    i.makeInstanceID(&server),
+		ProviderID:    i.makeInstanceID(region, &server),
 		InstanceType:  instanceType,
 		NodeAddresses: addresses,
 		Zone:          availabilityZone,
-		Region:        i.region,
+		Region:        region,
 	}, nil
 }
 
-func (i *InstancesV2) makeInstanceID(srv *servers.Server) string {
+func (i *InstancesV2) makeInstanceID(region string, srv *servers.Server) string {
 	if i.regionProviderID {
-		return fmt.Sprintf("%s://%s/%s", ProviderName, i.region, srv.ID)
+		return fmt.Sprintf("%s://%s/%s", ProviderName, region, srv.ID)
 	}
 	return fmt.Sprintf("%s:///%s", ProviderName, srv.ID)
 }
 
 func (i *InstancesV2) getInstance(ctx context.Context, node *v1.Node) (*servers.Server, error) {
+	server, _, _, _, err := i.getInstanceContext(ctx, node)
+	return server, err
+}
+
+func (i *InstancesV2) getInstanceContext(ctx context.Context, node *v1.Node) (*servers.Server, *gophercloud.ServiceClient, *gophercloud.ServiceClient, string, error) {
 	if node.Spec.ProviderID == "" {
-		return getServerByName(ctx, i.compute, node.Name)
+		region := i.lookupRegionForNode(node)
+		compute, network, err := i.clientsForRegion(region)
+		if err != nil {
+			return nil, nil, nil, "", err
+		}
+
+		server, err := getServerByName(ctx, compute, node.Name)
+		if err != nil {
+			return nil, nil, nil, "", err
+		}
+
+		return server, compute, network, region, nil
 	}
 
 	instanceID, instanceRegion, err := instanceIDFromProviderID(node.Spec.ProviderID)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, "", err
 	}
 
-	if instanceRegion != "" && instanceRegion != i.region {
-		return nil, fmt.Errorf("ProviderID \"%s\" didn't match supported region \"%s\"", node.Spec.ProviderID, i.region)
+	region := i.region
+	if instanceRegion != "" {
+		region = instanceRegion
+	}
+
+	compute, network, err := i.clientsForRegion(region)
+	if err != nil {
+		return nil, nil, nil, "", err
 	}
 
 	mc := metrics.NewMetricContext("server", "get")
-	server, err := servers.Get(ctx, i.compute, instanceID).Extract()
+	server, err := servers.Get(ctx, compute, instanceID).Extract()
 	if mc.ObserveRequest(err) != nil {
 		if errors.IsNotFound(err) {
-			return nil, cloudprovider.InstanceNotFound
+			return nil, nil, nil, "", cloudprovider.InstanceNotFound
 		}
-		return nil, err
+		return nil, nil, nil, "", err
 	}
-	return server, nil
+	return server, compute, network, region, nil
+}
+
+func (i *InstancesV2) clientsForRegion(region string) (*gophercloud.ServiceClient, *gophercloud.ServiceClient, error) {
+	if region == "" || strings.EqualFold(region, i.region) {
+		return i.compute, i.network, nil
+	}
+
+	epOpts := &gophercloud.EndpointOpts{
+		Region:       region,
+		Availability: i.availability,
+	}
+
+	compute, err := client.NewComputeV2(i.provider, epOpts)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	network, err := client.NewNetworkV2(i.provider, epOpts)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return compute, network, nil
+}
+
+func (i *InstancesV2) lookupRegionForNode(node *v1.Node) string {
+	if region := nodeRegion(node); region != "" {
+		return region
+	}
+
+	return i.region
+}
+
+func nodeRegion(node *v1.Node) string {
+	if node == nil {
+		return ""
+	}
+
+	for _, label := range []string{nodeRegionLabel, legacyNodeRegionLabel} {
+		if region := strings.TrimSpace(node.Labels[label]); region != "" {
+			return region
+		}
+	}
+
+	return ""
 }
 
 func getServerByName(ctx context.Context, client *gophercloud.ServiceClient, name string) (*servers.Server, error) {
